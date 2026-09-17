@@ -24,16 +24,40 @@ impl SseParser {
     }
 
     fn consume_line(&mut self, line: &str) {
-        if line.is_empty() || line.starts_with(':') { return; }
-        let Some(data) = line.strip_prefix("data:").map(str::trim) else { return };
-        if data == "[DONE]" { self.done = true; return; }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else { return };
-        if let Some(tokens) = value.get("usage").and_then(|usage| usage.get("completion_tokens")).and_then(|v| v.as_u64()) {
+        if line.is_empty() || line.starts_with(':') {
+            return;
+        }
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            return;
+        };
+        if data == "[DONE]" {
+            self.done = true;
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            return;
+        };
+        if let Some(tokens) = value
+            .get("usage")
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+        {
             self.tokens = self.tokens.max(tokens);
         }
-        let Some(delta) = value.get("choices").and_then(|choices| choices.as_array()).and_then(|choices| choices.first()).and_then(|choice| choice.get("delta")) else { return };
+        let Some(delta) = value
+            .get("choices")
+            .and_then(|choices| choices.as_array())
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+        else {
+            return;
+        };
         for field in ["content", "reasoning_content", "reasoning", "thinking"] {
-            if let Some(text) = delta.get(field).and_then(|v| v.as_str()).filter(|text| !text.is_empty()) {
+            if let Some(text) = delta
+                .get(field)
+                .and_then(|v| v.as_str())
+                .filter(|text| !text.is_empty())
+            {
                 self.ttft_content = true;
                 self.chunk_count += 1;
                 self.accumulated_chars += text.len();
@@ -117,7 +141,13 @@ async fn ping(host: &str, key: &str, opts: &ProbeOpts) -> Result<PingOutcome, St
     let resp = c
         .post(&url)
         .header("Authorization", format!("Bearer {key}"))
-        .json(&chat_body(host, &opts.prompt, opts.max_tokens, opts.temperature, false))
+        .json(&chat_body(
+            host,
+            &opts.prompt,
+            opts.max_tokens,
+            opts.temperature,
+            false,
+        ))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -137,7 +167,13 @@ async fn latency(host: &str, key: &str, opts: &ProbeOpts) -> Result<LatencyOutco
     let resp = c
         .post(&url)
         .header("Authorization", format!("Bearer {key}"))
-        .json(&chat_body(host, &opts.prompt, opts.max_tokens, opts.temperature, true))
+        .json(&chat_body(
+            host,
+            &opts.prompt,
+            opts.max_tokens,
+            opts.temperature,
+            true,
+        ))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -167,7 +203,9 @@ async fn latency(host: &str, key: &str, opts: &ProbeOpts) -> Result<LatencyOutco
         if parser.ttft_content && ttft.is_none() {
             ttft = Some(connected.elapsed().as_secs_f64());
         }
-        if parser.done { break; }
+        if parser.done {
+            break;
+        }
     }
 
     let total = started.elapsed().as_secs_f64();
@@ -175,7 +213,9 @@ async fn latency(host: &str, key: &str, opts: &ProbeOpts) -> Result<LatencyOutco
     // Fallback token count if usage chunk was not delivered by provider
     let mut tokens = parser.tokens;
     if tokens == 0 && parser.chunk_count > 0 {
-        tokens = parser.chunk_count.max((parser.accumulated_chars as u64 + 3) / 4);
+        tokens = parser
+            .chunk_count
+            .max((parser.accumulated_chars as u64 + 3) / 4);
     }
 
     // Fair throughput: tokens divided by generation streaming time (total - pure TTFT)
