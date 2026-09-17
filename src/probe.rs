@@ -3,6 +3,67 @@ use std::time::Instant;
 
 use crate::models::Capabilities;
 
+#[derive(Debug, Default)]
+struct SseParser {
+    buffer: String,
+    done: bool,
+    tokens: u64,
+    ttft_content: bool,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &str) {
+        self.buffer.push_str(chunk);
+        while let Some((end, separator_len)) = ["\n\n", "\r\n\r\n"]
+            .iter()
+            .filter_map(|separator| {
+                self.buffer
+                    .find(separator)
+                    .map(|end| (end, separator.len()))
+            })
+            .min_by_key(|(end, _)| *end)
+        {
+            let event = self.buffer[..end].to_string();
+            self.buffer = self.buffer[end + separator_len..].to_string();
+            self.consume_event(&event);
+        }
+    }
+
+    fn consume_event(&mut self, event: &str) {
+        let data = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data == "[DONE]" {
+            self.done = true;
+            return;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
+            return;
+        };
+        if json
+            .get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| {
+                self.tokens = v;
+                true
+            })
+        {}
+        self.ttft_content = self.ttft_content
+            || json
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|c| c.get("delta"))
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| !s.is_empty());
+    }
+}
+
 /// Result of probing one model. Phone fields omitted when a test was skipped.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ProbeResult {
@@ -47,7 +108,13 @@ fn client(timeout: u64) -> Result<reqwest::Client, String> {
 }
 
 /// Build the OpenAI chat body for a model.
-fn chat_body(model: &str, prompt: &str, max_tokens: u32, temp: f64, stream: bool) -> serde_json::Value {
+fn chat_body(
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    temp: f64,
+    stream: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -64,12 +131,21 @@ async fn ping(host: &str, key: &str, opts: &ProbeOpts) -> Result<PingOutcome, St
     let resp = c
         .post(&url)
         .header("Authorization", format!("Bearer {key}"))
-        .json(&chat_body(host, &opts.prompt, opts.max_tokens, opts.temperature, false))
+        .json(&chat_body(
+            host,
+            &opts.prompt,
+            opts.max_tokens,
+            opts.temperature,
+            false,
+        ))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
     let code = resp.status().as_u16();
-    Ok(PingOutcome { ok: code == 200, http_code: code })
+    Ok(PingOutcome {
+        ok: code == 200,
+        http_code: code,
+    })
 }
 
 /// Streaming latency: measures time-to-first-token and total time.
@@ -81,53 +157,35 @@ async fn latency(host: &str, key: &str, opts: &ProbeOpts) -> Result<LatencyOutco
     let resp = c
         .post(&url)
         .header("Authorization", format!("Bearer {key}"))
-        .json(&chat_body(host, &opts.prompt, opts.max_tokens, opts.temperature, true))
+        .json(&chat_body(
+            host,
+            &opts.prompt,
+            opts.max_tokens,
+            opts.temperature,
+            true,
+        ))
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
     if !resp.status().is_success() {
-        return Ok(LatencyOutcome { ttft_secs: None, total_secs: None, tokens: 0, rate_per_sec: None });
+        return Ok(LatencyOutcome {
+            ttft_secs: None,
+            total_secs: None,
+            tokens: 0,
+            rate_per_sec: None,
+        });
     }
 
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
+    let mut parser = SseParser::default();
     let mut ttft: Option<f64> = None;
-    let mut tokens: u64 = 0;
-    let mut buf = String::new();
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
-                let data = String::from_utf8_lossy(&chunk);
-                // TTFT: first chunk carrying non-empty content in a delta
-                if ttft.is_none() && data.contains("\"delta\":") && data.contains("\"content\":\"") {
-                    let j: serde_json::Value = match serde_json::from_str(
-                        &data.trim_start_matches("data:").trim(),
-                    ) {
-                        Ok(v) => v,
-                        Err(_) => serde_json::Value::Null,
-                    };
-                    let has_text = j
-                        .get("choices")
-                        .and_then(|c| c.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|x| x.get("delta"))
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                        .map(|s| !s.is_empty())
-                        .unwrap_or(false);
-                    if has_text {
-                        ttft = Some(started.elapsed().as_secs_f64());
-                    }
-                }
-                buf.push_str(&data);
-                // extract usage.completion_tokens (final chunk)
-                while let Some(idx) = buf.find("\"completion_tokens\":") {
-                    let rest = &buf[idx + "\"completion_tokens\":".len()..];
-                    let end = rest.find([',', '}']).unwrap_or(rest.len());
-                    if let Ok(v) = rest[..end].trim().parse::<u64>() {
-                        tokens = v;
-                    }
-                    buf = rest[end..].to_string();
+                parser.push(&String::from_utf8_lossy(&chunk));
+                if parser.ttft_content && ttft.is_none() {
+                    ttft = Some(started.elapsed().as_secs_f64());
                 }
             }
             Some(Err(_)) => break,
@@ -135,13 +193,49 @@ async fn latency(host: &str, key: &str, opts: &ProbeOpts) -> Result<LatencyOutco
         }
     }
     let total = started.elapsed().as_secs_f64();
-    let rate = if total > 0.0 { Some(tokens as f64 / total) } else { None };
-    Ok(LatencyOutcome { ttft_secs: ttft, total_secs: Some(total), tokens, rate_per_sec: rate })
+    let tokens = parser.tokens;
+    let rate = if total > 0.0 {
+        Some(tokens as f64 / total)
+    } else {
+        None
+    };
+    Ok(LatencyOutcome {
+        ttft_secs: ttft,
+        total_secs: Some(total),
+        tokens,
+        rate_per_sec: rate,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SseParser;
+
+    #[test]
+    fn parses_done_split_across_chunks() {
+        let mut parser = SseParser::default();
+        parser.push("data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n");
+        parser.push("data: [DO");
+        parser.push("NE]\n\n");
+        assert!(parser.done);
+        assert!(parser.ttft_content);
+    }
+
+    #[test]
+    fn parses_usage_from_complete_event() {
+        let mut parser = SseParser::default();
+        parser.push("data: {\"usage\":{\"completion_tokens\":7}}\n\n");
+        assert_eq!(parser.tokens, 7);
+        assert!(!parser.done);
+    }
 }
 
 /// Probe a single model.
 pub async fn probe_one(model: &str, opts: &ProbeOpts) -> Result<ProbeResult, String> {
-    let mut out = ProbeResult { model: model.to_string(), ..Default::default() };
+    let mut out = ProbeResult {
+        model: model.to_string(),
+        ..Default::default()
+    };
     if opts.do_ping {
         out.ping = Some(ping(model, &opts.api_key, opts).await?);
     }
