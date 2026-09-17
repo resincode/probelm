@@ -1,85 +1,209 @@
-# midas-model-test (Rust CLI)
+# probelm / mtest
 
-CLI untuk **testing provider / probe model** di gateway **9Router** — ping,
-latency (TTFT), dan capabilities. Output tabel di terminal (manusia) atau JSON
-(agent). Dibangun ulang dari `midas-model-tests` (bash) dalam **Rust**; skema
-config tetap kompatibel sehingga drop-in.
+CLI diagnostik, benchmarking, dan healthcheck model LLM di gateway **9Router** — mengukur ketersediaan (ping), latensi (*Time-to-First-Token* / TTFT), throughput (*tokens/sec*), dan inspeksi kapabilitas model.
 
-Requirement: [`srd-probelm/midas-model-test-requirement.md`](../srd-probelm/midas-model-test-requirement.md)
+Mendukung output tabel berwarna interaktif, format tabel Markdown (siap tempel di PR/issue), serta JSON terstruktur untuk otomasi AI Agent.
 
-## Build
+---
+
+## ⚡ 30-Second Quickstart
 
 ```bash
-cargo build --release          # binary: target/release/mtest
+# 1. Clone & install ke $HOME/.local/bin
+git clone https://github.com/resincode/probelm.git
+cd probelm
+./install.sh
+
+# 2. Inisialisasi konfigurasi (otomatis mendeteksi 9Router lokal & API key)
+mtest init --global -y
+
+# 3. Jalankan pengujian model
+mtest test
 ```
 
-Requirement: Rust (edisi 2021). HTTP: `reqwest` (tokio), CLI: `clap`,
-JSON: `serde`.
+*Catatan: Anda bisa memanggil binary menggunakan perintah `mtest` atau alias `probelm`.*
 
-## Config
+---
 
-Prioritas **env > file** (file default `config.json`; ganti dengan `--config`):
+## 🚀 Panduan Penggunaan (*Usage & Recipes*)
 
-| Value | Env | JSON field | Default |
-|-------|-----|-----------|---------|
-| baseUrl | `ROUTER_URL` | `endpoint.baseUrl` | `http://localhost:20128` |
-| apiKey | `ROUTER_KEY` | `endpoint.apiKey` | — (wajib) |
-| models | | `models[]` | dari discovery |
-| prompt | | `defaultPrompt` / `prompts.<model>` | `"Reply with exactly: OK"` |
-| maxTokens / temperature / timeoutSeconds | | | 64 / 0 / 120 |
+Subcommand utama untuk pengujian adalah **`test`** (dengan alias **`check`**, **`bench`**, **`probe`**, atau **`run`**).
 
+### 1. Pengujian Model Sederhana & Positional Arguments
+```bash
+# Uji model yang ada di file konfigurasi
+mtest test
+
+# Uji satu atau beberapa model tertentu secara langsung (positional)
+mtest test midas/glm-5.2
+mtest test midas/glm-5.2 midas/deepseek-v4-pro
+
+# Uji SEMUA model yang terdaftar di 9Router (bypass list config)
+mtest test --all
+```
+
+### 2. Filter Berdasarkan Wildcard, Prefix & Kapabilitas
+```bash
+# Pola Wildcard langsung di positional arguments (misal 'cx/*', 'ag/*', '*glm*')
+mtest test "cx/*"
+mtest test "cx/*" "ag/*"
+mtest test "*gpt-5.6*"
+
+# Uji prefix tertentu via flag --prefix (mendukung multi-prefix dipisah koma)
+mtest test --prefix cx
+mtest test --prefix cx,ag,midas
+
+# Uji model berdasarkan owner/grup (misal 'combo', 'midas', 'cx')
+mtest test --owned-by combo
+
+# Uji hanya model yang memiliki kapabilitas tertentu (reasoning, vision, tools)
+mtest test --cap reasoning
+mtest test --all --cap vision
+```
+
+### 3. Pengurutan Hasil (*Multi-Key Sorting*)
+Mendukung pengurutan multi-kriteria (bisa digabung dengan koma `,`) serta modifier `:asc` / `:desc`:
+
+| Kunci Sort | Keterangan | Default Arah |
+| :--- | :--- | :--- |
+| `ctx` / `context` | Jumlah context window | Descending (terbesar dulu) |
+| `speed` / `rate` | Kecepatan generasi (TOK/s) | Descending (tercepat dulu) |
+| `ttft` / `latency` | *Time-to-first-token* | Ascending (latensi terendah dulu) |
+| `out` / `max_out` | Batas maksimum output token | Descending (terbesar dulu) |
+| `ping` / `status` | Status ketersediaan | OK dulu |
+| `name` / `model` | Nama model (A-Z) | Ascending |
+
+```bash
+# Urutkan berdasarkan Context Window terbesar (misal: 1m -> 400k -> 200k)
+mtest test --all --sort ctx
+
+# Multi-criteria sort: urutkan berdasarkan Context Window lalu Kecepatan (TOK/s)
+mtest test --all --sort ctx,speed
+
+# Urutkan berdasarkan TTFT tercepat lalu TOK/s
+mtest test --all --sort ttft,speed
+
+# Override arah pengurutan dengan modifier :asc atau :desc
+mtest test --all --sort ctx:asc
+```
+### 4. Custom Prompt & Stress Testing Paralel
+```bash
+# Menguji model dengan prompt kustom dari terminal
+mtest test midas/deepseek-v4-pro -p "Jelaskan konsep zero-copy dalam 2 kalimat."
+
+# Menjalankan pengujian 8 model secara bersamaan (paralel)
+mtest test --all --jobs 8
+```
+
+### 5. Pilihan Format Output
+```bash
+# Format tabel terminal berwarna (default)
+mtest test
+
+# Format tabel Markdown (siap salin ke GitHub PR / issue / docs)
+mtest test midas/glm-5.2 midas/deepseek-v4-pro --md
+
+# Format JSON terstruktur (ideal untuk pipeline / agent / jq)
+mtest test --all --json
+
+# Hanya cek ping / latensi / kapabilitas saja
+mtest test --ping
+mtest test --latency
+mtest test --all --caps-only
+```
+
+### 6. Model Discovery (`list`)
+```bash
+# Menampilkan semua model yang tersedia di gateway
+mtest list
+
+# Filter model list
+mtest list --prefix cx
+mtest list --owned-by midas
+
+# Ekspor katalog model ke file JSON
+mtest list --prefix midas --list-models midas-models.json
+```
+### 7. Sinkronisasi Spesifikasi Model Resmi (`sync-specs`)
+Mengunduh database spesifikasi resmi 2,800+ model dari LiteLLM / Source of Truth global untuk mengoreksi metadata gateway lokal yang salah/kurang update:
+
+```bash
+# Sinkronkan database spesifikasi model terbaru
+mtest sync-specs
+```
+
+---
+
+## 🖥️ Contoh Output Tampilan
+
+### Format Terminal Interaktif:
+```text
+MODEL                                PING   TTFT(s) TOTAL(s)   TOK/s  CAPS            CTX    OUT
+-----------------------------------------------------------------------------------------------
+midas/glm-5.2                        OK       1.481    1.614    19.2  🧠 🛠            1m   131k
+midas/deepseek-v4-pro                OK       0.101    0.106    12.5  🧠 🛠            1m   393k
+cx/gpt-5.6-sol                       OK       0.842    0.855    21.4  🧠 👁 🛠 🔍    922k   128k
+-----------------------------------------------------------------------------------------------
+Legend: 🧠 Reasoning  👁 Vision  🛠 Tools  📄 PDF  🔍 Search  🎙 Audio  🎬 Video  🎨 Image
+```
+
+### Format Markdown Table (`--md`):
+| Model | Ping | TTFT (s) | Total (s) | Tok/s | Caps | Context | Max Out |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `midas/glm-5.2` | OK | 1.481 | 1.614 | 19.2 | 🧠 🛠 | 1m | 131k |
+| `midas/deepseek-v4-pro` | OK | 0.101 | 0.106 | 12.5 | 🧠 🛠 | 1m | 393k |
+
+## ⚙️ Konfigurasi
+
+Prioritas resolusi konfigurasi:
+1. Argument CLI `--config <path>`
+2. Environment Variables (`ROUTER_KEY` & `ROUTER_URL`)
+3. File lokal `./config.json`
+4. File global `$HOME/.config/probelm/config.json`
+
+Contoh isi `config.json`:
 ```json
 {
-  "endpoint": { "baseUrl": "http://localhost:20128", "apiKey": "sk-..." },
-  "models": ["midas/glm-4.7", "midas/deepseek-v4-pro"],
+  "endpoint": {
+    "baseUrl": "http://localhost:20128",
+    "apiKey": "sk-..."
+  },
+  "models": [
+    "midas/glm-5.2",
+    "midas/deepseek-v4-pro"
+  ],
   "defaultPrompt": "Reply with exactly: OK",
-  "maxTokens": 64, "temperature": 0, "timeoutSeconds": 120
+  "maxTokens": 64,
+  "temperature": 0.0,
+  "timeoutSeconds": 120
 }
 ```
 
-## Usage
+---
 
+## 📦 Instalasi & Build Manual
+
+### Menggunakan Installer Script (Rekomendasi macOS / Linux):
 ```bash
-# Discover models (tabel / JSON)
-mtest list --config config.json
-mtest list --config config.json --json
-mtest list --config config.json --owned-by midas
-mtest list --config config.json --prefix midas --list-models   # ekspor models.json
+./install.sh
 
-# Probe model (ping + latency + caps default)
-mtest probe --config config.json --model midas/glm-4.7
-mtest probe --config config.json --model a,b --json           # untuk agent
-mtest probe --config config.json --prefix midas --cap reasoning
-mtest probe --config config.json --ping | --latency | --caps-only
-mtest probe --config config.json --jobs 4                     # paralel
+# Untuk uninstall:
+./install.sh --uninstall
 ```
 
-## Output
-
-**Tabel (default):** kolom `MODEL PING TTFT(s) TOTAL(s) TOK/s CAPABILITIES`.
-
-**JSON (`--json`):** satu objek stabil untuk agent:
-
-```json
-{ "probes": [ {
-    "model": "midas/glm-4.7",
-    "ping":  { "ok": true, "http_code": 200 },
-    "latency": { "ttft_secs": 0.08, "total_secs": 0.12, "tokens": 1, "rate_per_sec": 7.9 },
-    "caps": { "vision": false, "reasoning": true, "contextWindow": 200000, "maxOutput": 128000, ... }
-} ] }
+### Build Manual dengan Cargo:
+```bash
+cargo build --release
+# Binary berada di: target/release/mtest
 ```
 
-Field absen bila test di-skip.
+---
 
-**Exit code:** `0` sukses / semua OK · `1` ada model ping gagal · `2` error config/usage.
+## 🛡️ Keamanan
+- Hanya menggunakan **Gateway API Key** (untuk autentikasi ke 9Router lokal) — tidak ada API key upstream provider pihak ketiga yang disimpan oleh tool ini.
+- API key tidak pernah dicetak utuh di log/terminal (*auto-masked* saat setup).
 
-## Note keamanan
+---
 
-- Hanya memakai **gateway key** (untuk auth ke 9Router) — tidak ada key upstream
-  provider di tool ini.
-- `ROUTER_KEY` env override file; jangan commit `config.json`.
-- API key tidak pernah dicetak.
-
-## License
-
-MIT.
+## 📄 Lisensi
+MIT License.
